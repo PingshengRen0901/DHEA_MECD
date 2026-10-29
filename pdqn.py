@@ -1,457 +1,280 @@
-import math
+"""DHEA-MECD learner, paper Algorithm 1 and Eqs. (24)-(36)."""
+from collections import deque
+from copy import deepcopy
+from dataclasses import asdict
+from pathlib import Path
+import random
+
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import gym
-import wandb
-import time
-from collections import deque
-import random
-from PER import *
-from hyenv.environment import PITCH
-from encoder import *
-# 超参数设置
-USE_WANDB = False
-RENDER = False
-RECORD = True
-N_STATES = 9  # 状态空间的维度（与环境观测25维对齐）
-N_PARAM = 3  # 连续参数的维度
-N_ACTIONS = 4  # 动作空间的维度
-MEMORY_CAPCITY = 200000  # 记忆库容量
-LR_ALPHA = 0.001  # Q网络的学习率
-LR_BETA = 0.001  # X网络的学习率
-TARGET_PREDICT_ITER = 200  # 目标网络更新频率
-BATCH_SIZE = 64  # 每次训练的批次大小
-GAMMA = 0.95  # 折扣因子
-TOTAL_EPISODE = 25000  # 总训练回合数
-MAX_STEP = 300  # 每回合的最大步数
-device = "cpu"  # 设备选择
+from torch import nn
 
-
-# from encoder import *
+from config import AgentConfig, ObservationLayout
+from encoder import make_encoder
+from PER import PrioritizedExperienceReplay
 
 
 class ExpertNetwork(nn.Module):
-    """独立专家网络基类"""
+    """Independent GRU-MLP and learned stage-specific latent perception, Eq. 28."""
+    def __init__(self, latent_dim, config, stage):
+        super().__init__()
+        self.gru = nn.GRU(latent_dim, config.gru_hidden, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(config.gru_hidden + config.param_dim, config.expert_hidden),
+                                 nn.ReLU(), nn.Linear(config.expert_hidden, config.action_dim))
+        # Stage supports are learned in latent coordinates, not raw-state indices.
+        self.feature_weights = nn.Parameter(torch.full((latent_dim,), -2.0))
+        with torch.no_grad():
+            self.feature_weights[stage::config.num_experts] = 2.0
+        self.perception = nn.Sequential(nn.Linear(latent_dim, config.expert_hidden), nn.ReLU(),
+                                        nn.Linear(config.expert_hidden, config.action_dim))
+        self.stage_bias = nn.Parameter(torch.zeros(config.action_dim))
 
-    def __init__(self, in_dim, a_dim):
-        super(ExpertNetwork, self).__init__()
-        # GRU层处理时间序列输入
-        self.gru = nn.GRU(in_dim, 256, batch_first=True)
-        # 全连接层
-        self.encoder = Encoder3D_FeatureEnhanced(
-            input_dim=in_dim,
-            output_dim=256
-        )
-        self.fc1 = nn.Linear(256, 64)
-        # self.fc2 = nn.Linear(128, 64)
-        # 输出层
-        self.out = nn.Linear(64, a_dim)
-        # 供子类使用的可用组件与属性（提供安全默认值）
-        # 加速偏置（默认不偏置）
-        self.acceleration_bias = 0.0
-        # 额外感知模块：将标量特征映射到动作维度，默认初始化为零以不产生影响
-        self.altitude_aware = nn.Linear(1, a_dim)
-        self.depth_aware = nn.Linear(1, a_dim)
-        self.vertical_distance_aware = nn.Linear(1, a_dim)
-        self.vertical_speed_aware = nn.Linear(1, a_dim)
-        # 初始化权重
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        # 使用Xavier初始化替代原来的normal初始化
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.xavier_uniform_(self.out.weight)
-        # 初始化偏置
-        nn.init.constant_(self.fc1.bias, 0)
-        nn.init.constant_(self.out.bias, 0)
-        # 将感知模块初始化为零，不影响初始输出
-        for layer in [
-            self.altitude_aware,
-            self.depth_aware,
-            self.vertical_distance_aware,
-            self.vertical_speed_aware,
-        ]:
-            nn.init.constant_(layer.weight, 0)
-            nn.init.constant_(layer.bias, 0)
-
-    def forward(self, x):
-        # 添加时间维度
-        x = x.unsqueeze(1)
-        # GRU处理
-        _, x = self.gru(x)
-        # 获取最后一个时间步的输出
-        x = x[-1, :, :]
-        # 全连接层
-        x = F.relu(self.fc1(x))
-
-        # 输出Q值
-        q = self.out(x)
-        return q
+    def forward(self, latent_sequence, parameters):
+        outputs, _ = self.gru(latent_sequence)
+        q = self.mlp(torch.cat([outputs[:, -1], parameters], dim=-1))
+        stage_features = latent_sequence[:, -1] * self.feature_weights.sigmoid()
+        return q + self.perception(stage_features) + self.stage_bias
 
 
-class AccelerationExpert(ExpertNetwork):
-    """加速专家 - 专门处理加速任务"""
-    
-    def __init__(self, in_dim, a_dim):
-        super(AccelerationExpert, self).__init__(in_dim, a_dim)
-        self.acceleration_bias = 0.3
-        
-    def forward(self, x):
-        # 基类前向传播
-        q_values = super().forward(x)
-        
-        # 简单感知：距离远时更倾向于加速
-        distance = x[:, 6:7]  # 距离特征
-        distance_effect = self.altitude_aware(distance)
-        q_values += distance_effect * 0.1
-        
-        # 对加速动作给予额外奖励
-        q_values[:, 0] += self.acceleration_bias
-        
-        return q_values
-
-
-class CruisingExpert(ExpertNetwork):
-    """巡航专家 - 专门处理稳定巡航任务"""
-    
-    def __init__(self, in_dim, a_dim):
-        super(CruisingExpert, self).__init__(in_dim, a_dim)
-        self.cruising_bias = 0.2
-        
-    def forward(self, x):
-        # 基类前向传播
-        q_values = super().forward(x)
-        
-        # 简单感知：中等进度时适合巡航（用step_ratio近似）
-        progress = x[:, 8:9]  # 归一化进度
-        progress_effect = self.depth_aware(progress - 0.5)
-        q_values += progress_effect * 0.1
-        
-        # 对所有动作给予巡航奖励
-        q_values += self.cruising_bias
-        
-        return q_values
-
-
-class BrakingExpert(ExpertNetwork):
-    """刹车专家 - 专门处理减速任务"""
-    
-    def __init__(self, in_dim, a_dim):
-        super(BrakingExpert, self).__init__(in_dim, a_dim)
-        self.braking_bias = 0.4
-        
-    def forward(self, x):
-        # 基类前向传播
-        q_values = super().forward(x)
-        
-        # 简单感知：距离近时更倾向于刹车
-        distance = x[:, 6:7]  # 距离特征
-        distance_effect = self.altitude_aware(distance)
-        q_values += distance_effect * -0.1  # 负权重，距离近时激活
-        
-        # 对刹车动作给予额外奖励
-        q_values[:, 3] += self.braking_bias
-        
-        return q_values
-
-
-class HeightAdjustmentExpert(ExpertNetwork):
-    """高度调整专家 - 专门处理高度调整任务"""
-
-    def __init__(self, in_dim, a_dim):
-        super(HeightAdjustmentExpert, self).__init__(in_dim, a_dim)
-        self.height_adjustment_bias = 0.5
-        
-    def forward(self, x):
-        # 基类前向传播
-        q_values = super().forward(x)
-
-        # 简单感知：高度误差大时需要调整
-        agent_z = x[:, 2:3]  # 智能体高度
-        target_z = x[:, 5:6]  # 目标高度
-        height_error = agent_z - target_z
-        height_error_effect = self.altitude_aware(height_error)
-        q_values += height_error_effect * 0.2
-
-        # 对俯仰动作给予额外奖励
-        q_values[:, PITCH] += self.height_adjustment_bias
-
-        return q_values
-
-class FineTuningExpert(ExpertNetwork):
-    
-    """微调专家 - 用于精确控制"""
-
-    def __init__(self, in_dim, a_dim):
-        super(FineTuningExpert, self).__init__(in_dim, a_dim)
-        self.fine_tuning_bias = 0.3
-        
-    def forward(self, x):
-        # 基类前向传播
-        q_values = super().forward(x)
-
-        # 简单感知：进度高时进行微调
-        progress = x[:, 8:9]  # 进度比例
-        progress_effect = self.vertical_distance_aware(progress)
-        q_values += progress_effect * 0.1
-
-        # 对所有动作给予微调奖励
-        q_values += self.fine_tuning_bias
-
-        return q_values
 class ImprovedMoEGatingNetwork(nn.Module):
-    """改进的MoE门控网络 - 决定专家权重"""
-
-    def __init__(self, input_dim, num_experts, hidden_dim=128, k=2):
-        """
-        Args:
-            input_dim: 输入维度
-            num_experts: 专家数量
-            hidden_dim: 隐藏层维度
-            k: 激活的专家数量
-        """
-        super(ImprovedMoEGatingNetwork, self).__init__()
-        self.num_experts = num_experts
+    """Bilinear latent-to-expert-key matching and sparse softmax, Eqs. 26-27."""
+    def __init__(self, input_dim, num_experts=5, hidden_dim=128, k=2):
+        super().__init__()
+        if not 1 <= k <= num_experts:
+            raise ValueError("Invalid top-k")
         self.k = k
+        self.query = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.expert_keys = nn.Parameter(torch.empty(num_experts, hidden_dim))
+        self.bias = nn.Parameter(torch.zeros(num_experts))
+        nn.init.normal_(self.expert_keys, std=hidden_dim ** -0.5)
 
-        # 更深的门控网络
-        self.gate = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),  # 添加dropout防止过拟合
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, num_experts)
-        )
-
-        # 温度参数控制softmax的锐度
-        self.temperature = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, x):
-        # 计算门控分数
-        gate_scores = self.gate(x) / self.temperature
-
-        # Top-k选择
-        top_k_values, top_k_indices = gate_scores.topk(self.k, dim=1)
-
-        # 创建稀疏掩码
-        mask = torch.zeros_like(gate_scores)
-        mask.scatter_(1, top_k_indices, 1)
-
-        # 应用softmax到选中的专家
-        sparse_scores = gate_scores * mask
-        sparse_scores = sparse_scores - sparse_scores.max(dim=1, keepdim=True).values
-        exp_scores = torch.exp(sparse_scores)
-        exp_scores = exp_scores * mask  # 确保未选中的专家权重为0
-        weights = exp_scores / (exp_scores.sum(dim=1, keepdim=True) + 1e-6)
-
-        return weights
-
-
-class SumLoss(nn.Module):
-    def __init__(self):
-        super(SumLoss, self).__init__()
-
-    def forward(self, q_all):
-        sigma_q = torch.sum(q_all, 1)
-        loss_x = -torch.mean(sigma_q)
-        return loss_x
+    def forward(self, latent):
+        scores = self.query(latent) @ self.expert_keys.T + self.bias
+        values, indices = scores.topk(self.k, dim=-1)
+        return torch.zeros_like(scores).scatter(1, indices, values.softmax(dim=-1))
 
 
 class MoEQNet(nn.Module):
-    """MoE Q网络系统"""
+    stage_names = ("acceleration", "cruising", "braking", "height_adjustment", "fine_tuning")
 
-    def __init__(self, state_dim, action_dim, num_experts=5, k=2):
-        super(MoEQNet, self).__init__()
-        self.state_dim = state_dim
-        self.num_experts = num_experts
-        self.k = k
+    def __init__(self, state_dim, action_dim=4, num_experts=5, k=2, config=None):
+        super().__init__()
+        cfg = config or AgentConfig(latent_dim=state_dim, action_dim=action_dim,
+                                    num_experts=num_experts, top_k=k)
+        self.experts = nn.ModuleList([ExpertNetwork(state_dim, cfg, i) for i in range(cfg.num_experts)])
+        self.gating_network = ImprovedMoEGatingNetwork(state_dim, cfg.num_experts, k=cfg.top_k)
+        self.action_dim = cfg.action_dim
 
-        # 创建独立专家
-        self.experts = nn.ModuleList([
-            AccelerationExpert(state_dim, action_dim),
-            CruisingExpert(state_dim, action_dim),
-            BrakingExpert(state_dim, action_dim),
-            HeightAdjustmentExpert(state_dim, action_dim),
-            FineTuningExpert(state_dim, action_dim)
-        ])
+    def forward(self, latent_sequence, parameters):
+        if latent_sequence.ndim == 2:
+            latent_sequence = latent_sequence.unsqueeze(1)
+        gates = self.gating_network(latent_sequence[:, -1])
+        combined = latent_sequence.new_zeros((latent_sequence.shape[0], self.action_dim))
+        # Sparse dispatch: each expert processes only the rows routing to it.
+        for i, expert in enumerate(self.experts):
+            rows = torch.nonzero(gates[:, i] > 0, as_tuple=True)[0]
+            if rows.numel():
+                q = expert(latent_sequence.index_select(0, rows), parameters.index_select(0, rows))
+                combined = combined.index_add(0, rows, q * gates[rows, i, None])
+        return combined, gates
 
-        # 使用改进的门控网络
-        self.gating_network = ImprovedMoEGatingNetwork(state_dim, num_experts, k=k)
 
-    def forward(self, x):
-        """前向传播方法"""
-        # 获取门控权重
-        gates = self.gating_network(x)
-
-        # 计算各专家输出
-        expert_outputs = []
-        for expert in self.experts:
-            expert_outputs.append(expert(x))
-        expert_outputs = torch.stack(expert_outputs, dim=1)
-
-        # 加权组合专家输出
-        # 扩展维度以进行广播
-        gates = gates.unsqueeze(2)
-        # 加权求和
-        combined_output = torch.sum(expert_outputs * gates, dim=1)
-
-        # 返回组合Q值和门控权重
-        return combined_output, gates.squeeze(2)
-
-        # Xnet类，定义了参数网络
 class Xnet(nn.Module):
-    def __init__(self, s_dim, param_dim):
-        super(Xnet, self).__init__()
-        self.gru = nn.GRU(s_dim, 256, batch_first=True)
-        self.fc1 = nn.Linear(256, 128)  # 替换线性层
-        self.fc2 = nn.Linear(128, 64)
-        self.out = nn.Linear(64, param_dim)
-        self._initialize_weights()
+    def __init__(self, s_dim, param_dim=4, hidden_dim=256):
+        super().__init__()
+        self.gru = nn.GRU(s_dim, hidden_dim, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 64),
+                                 nn.ReLU(), nn.Linear(64, param_dim), nn.Tanh())
 
-    def _initialize_weights(self):
-        # 使用Xavier初始化
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.xavier_uniform_(self.fc2.weight)
-        nn.init.xavier_uniform_(self.out.weight)
-        # 初始化偏置
-        nn.init.constant_(self.fc1.bias, 0)
-        nn.init.constant_(self.fc2.bias, 0)
-        nn.init.constant_(self.out.bias, 0)
+    def forward(self, latent_sequence):
+        if latent_sequence.ndim == 2:
+            latent_sequence = latent_sequence.unsqueeze(1)
+        sequence, _ = self.gru(latent_sequence)
+        return self.mlp(sequence[:, -1])
 
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        _, x = self.gru(x)
-        x = x[-1, :, :]
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        param = torch.tanh(self.out(x))  # 使用tanh激活函数来约束输出范围
-        return param
+
+class SingleQNet(nn.Module):
+    """Single GRU-MLP head used by PDQN and the w/o MECD ablation."""
+    def __init__(self, config):
+        super().__init__()
+        self.gru = nn.GRU(config.latent_dim, config.gru_hidden, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(config.gru_hidden + config.param_dim, config.expert_hidden),
+                                 nn.ReLU(), nn.Linear(config.expert_hidden, config.action_dim))
+
+    def forward(self, latent_sequence, parameters):
+        output, _ = self.gru(latent_sequence)
+        q = self.mlp(torch.cat([output[:, -1], parameters], dim=-1))
+        return q, q.new_ones((q.shape[0], 1))
+
+
+def soft_update(target, source, tau):
+    with torch.no_grad():
+        for target_parameter, parameter in zip(target.parameters(), source.parameters()):
+            target_parameter.lerp_(parameter, tau)
+        for target_buffer, buffer in zip(target.buffers(), source.buffers()):
+            if target_buffer.is_floating_point():
+                target_buffer.lerp_(buffer, tau)
+            else:
+                target_buffer.copy_(buffer)
+
+
+def td_target(reward, terminated, next_q, gamma):
+    return reward + gamma * (1 - terminated) * next_q.max(dim=1, keepdim=True).values
 
 
 class PDQN:
-    def __init__(self):
-        # 初始化X网络
-        self.xnet = Xnet(N_STATES, N_PARAM).to(device)
+    """Historical class name retained as the DHEA-MECD entry point."""
+    def __init__(self, layout=None, config=None, seed=42):
+        self.layout = layout or ObservationLayout()
+        self.config = config or AgentConfig()
+        cfg = self.config
+        self.device = torch.device(cfg.device)
+        self.rng = np.random.default_rng(seed)
+        self.encoder = make_encoder(self.layout, cfg).to(self.device)
+        self.xnet = Xnet(cfg.latent_dim, cfg.param_dim, cfg.gru_hidden).to(self.device)
+        self.eval_qnet = (MoEQNet(cfg.latent_dim, config=cfg) if cfg.use_moe else SingleQNet(cfg)).to(self.device)
+        self.target_encoder = deepcopy(self.encoder).eval().requires_grad_(False)
+        self.target_xnet = deepcopy(self.xnet).eval().requires_grad_(False)
+        self.target_qnet = deepcopy(self.eval_qnet).eval().requires_grad_(False)
+        self.optimizer_q = torch.optim.Adam(
+            list(self.encoder.parameters()) + list(self.eval_qnet.parameters()), lr=cfg.lr_q)
+        self.optimizer_x = torch.optim.Adam(self.xnet.parameters(), lr=cfg.lr_actor)
+        self.memory = PrioritizedExperienceReplay(cfg.capacity, alpha=0.6 if cfg.prioritized else 0.0, seed=seed)
+        self.memory_counter = self.learn_step_counter = 0
+        self.history = deque(maxlen=cfg.sequence_length)
+        self.last_gate_weights = np.zeros(cfg.num_experts)
 
-        # 使用MoE Q网络系统
-        self.eval_qnet = MoEQNet(N_STATES + N_PARAM, N_ACTIONS, k=2).to(device)
-        self.target_qnet = MoEQNet(N_STATES + N_PARAM, N_ACTIONS, k=2).to(device)
+    def reset_episode(self):
+        self.history.clear()
 
-        # 学习计数器
-        self.learn_step_counter = 0
-        self.memory_counter = 0
+    def epsilon(self, episode):
+        cfg = self.config
+        return max(cfg.epsilon_start - episode * cfg.epsilon_decay, cfg.epsilon_min)
 
-        # 经验回放
-        self.prioritized = False
-        if self.prioritized:
-            self.memory = PrioritizedExperienceReplay(capacity=MEMORY_CAPCITY)
-        else:
-            self.memory = np.zeros((MEMORY_CAPCITY, N_STATES * 2 + 2 + N_PARAM))
+    def _tensor(self, array):
+        return torch.as_tensor(array, dtype=torch.float32, device=self.device)
 
-        # 优化器
-        self.optimizer_q = torch.optim.Adam(self.eval_qnet.parameters(), lr=LR_ALPHA)
-        self.optimizer_x = torch.optim.Adam(self.xnet.parameters(), lr=LR_BETA)
+    @torch.no_grad()
+    def choose_action(self, state, episode=0, explore=True):
+        self.history.append(np.asarray(state, dtype=np.float32).copy())
+        states = [self.history[0]] * (self.config.sequence_length - len(self.history)) + list(self.history)
+        # Dropout and BatchNorm must be deterministic during rollout/evaluation.
+        modules = (self.encoder, self.xnet, self.eval_qnet)
+        modes = [module.training for module in modules]
+        for module in modules:
+            module.eval()
+        try:
+            latent = self.encoder(self._tensor(np.stack(states)[None]))
+            parameters = self.xnet(latent)
+            q, gates = self.eval_qnet(latent, parameters)
+            self.last_gate_weights = gates[0].cpu().numpy()
+            action = q.argmax(dim=1).cpu().numpy()
+            parameters = parameters.cpu().numpy()
+        finally:
+            for module, mode in zip(modules, modes):
+                module.train(mode)
+        if explore and self.rng.random() < self.epsilon(episode):
+            action = np.array([self.rng.integers(self.config.action_dim)])
+            parameters = self.rng.uniform(-1, 1, (1, self.config.param_dim)).astype(np.float32)
+        return action, parameters
 
-        # 专家使用历史
-        self.expert_usage_history = []
-        self.phase_history = []
-
-    # 在choose_action方法中添加阶段识别
-    def choose_action(self, s, episode):
-        # 识别当前阶段
-        current_phase = self.rule_based_phase_identification(s)
-        self.phase_history.append(current_phase)
-
-        s = torch.unsqueeze(torch.FloatTensor(s), 0).to(device)
-        params = self.xnet(s)
-        input_tensor = torch.cat([s, params], 1)
-
-        # 使用MoE系统获取Q值和门控权重
-        actions_value, gate_weights = self.eval_qnet(input_tensor)
-
-        # 记录专家使用情况
-        gate_weights_np = gate_weights.detach().cpu().numpy().flatten()
-        self.expert_usage_history.append(gate_weights_np)
-
-        params = params.data.cpu().numpy()
-        if np.random.uniform() > max(1 - episode * 0.0002, 0.1):
-            action = torch.max(actions_value, 1)[1].data.cpu().numpy()
-        else:
-            action = np.random.randint(0, N_ACTIONS)
-            action = np.array([action])
-            params = np.random.uniform(low=[0, -1, -1], high=[1, 1, 1], size=(1, 3))
-
-        return action, params
-
-    def store_transition(self, s, a, x, r, s_):
-        x = torch.squeeze(torch.FloatTensor(x), 0)
-        transition = np.hstack((s, a, x, [r], s_))
-        if self.prioritized:
-            self.memory.store(transition)
-        else:
-            index = self.memory_counter % MEMORY_CAPCITY
-            self.memory[index, :] = transition
-            self.memory_counter += 1
+    def store_transition(self, state, action, parameters, reward, next_state,
+                         terminated=False, truncated=False):
+        row = np.concatenate([np.asarray(state).reshape(-1), [int(np.asarray(action).item())],
+                              np.asarray(parameters).reshape(-1), [reward, terminated, terminated or truncated],
+                              np.asarray(next_state).reshape(-1)])
+        expected = 2 * self.layout.state_dim + self.config.param_dim + 4
+        if row.size != expected or not np.isfinite(row).all():
+            raise ValueError("Malformed replay transition")
+        self.memory.store(row)
+        self.memory_counter += 1
 
     def learn(self):
-        # 目标网络更新
-        if self.learn_step_counter % TARGET_PREDICT_ITER == 0:
-            self.target_qnet.load_state_dict(self.eval_qnet.state_dict())
-        self.learn_step_counter += 1
-
-        # 从经验池中采样
-        if self.prioritized:
-            tree_idx, batch_memory, ISWeights = self.memory.sample(BATCH_SIZE)
-            ISWeights = torch.FloatTensor(ISWeights).to(device).view(BATCH_SIZE, 1)
-        else:
-            sample_index = np.random.choice(MEMORY_CAPCITY, BATCH_SIZE)
-            batch_memory = self.memory[sample_index, :]
-            ISWeights = torch.ones(BATCH_SIZE, 1).to(device)
-
-        # 提取批处理数据
-        b_s = torch.FloatTensor(batch_memory[:, :N_STATES]).to(device)
-        b_a = torch.LongTensor(batch_memory[:, N_STATES:N_STATES + 1].astype(int)).to(device)
-        b_x = torch.FloatTensor(batch_memory[:, N_STATES + 1:N_STATES + 1 + N_PARAM]).to(device)
-        b_r = torch.FloatTensor(batch_memory[:, N_STATES + 1 + N_PARAM:N_STATES + 1 + N_PARAM + 1]).to(device)
-        b_s_ = torch.FloatTensor(batch_memory[:, -N_STATES:]).to(device)
-
-        # 计算Q网络损失
-        q_eval, _ = self.eval_qnet(torch.cat((b_s, b_x), 1))
-        q_eval = q_eval.gather(1, b_a)
-
-        next_params = self.xnet(b_s_)
-        q_next, _ = self.target_qnet(torch.cat((b_s_, next_params.detach()), 1))
-        q_target = b_r + GAMMA * q_next.max(1)[0].view(BATCH_SIZE, 1)
-
-        if self.prioritized:
-            abs_errors = torch.abs(q_target - q_eval).detach().cpu().numpy()
-            self.memory.batch_update(tree_idx, abs_errors)
-            loss_q = (ISWeights * F.mse_loss(q_eval, q_target, reduction='none')).mean()
-        else:
-            loss_q = F.mse_loss(q_eval, q_target)
-
-        # 清零梯度并反向传播Q网络损失
-        self.optimizer_q.zero_grad()
+        cfg = self.config
+        if len(self.memory) < cfg.batch_size:
+            return None
+        indices, rows, weights = self.memory.sample(cfg.batch_size)
+        n, p = self.layout.state_dim, cfg.param_dim
+        states = self.memory.state_sequences(indices, n, cfg.sequence_length)
+        next_states = np.concatenate([states[:, 1:], rows[:, -n:][:, None]], axis=1)
+        actions = torch.as_tensor(rows[:, n], dtype=torch.long, device=self.device).unsqueeze(1)
+        parameters = self._tensor(rows[:, n + 1:n + 1 + p])
+        rewards = self._tensor(rows[:, n + 1 + p:n + 2 + p])
+        terminal = self._tensor(rows[:, n + 2 + p:n + 3 + p])
+        latent = self.encoder(self._tensor(states))
+        q, _ = self.eval_qnet(latent, parameters)
+        selected_q = q.gather(1, actions)
+        with torch.no_grad():
+            next_latent = self.target_encoder(self._tensor(next_states))
+            next_parameters = self.target_xnet(next_latent)
+            next_q, _ = self.target_qnet(next_latent, next_parameters)
+            target = td_target(rewards, terminal, next_q, cfg.gamma)
+        errors = target - selected_q
+        loss_q = (self._tensor(weights) * errors.square()).mean()
+        self.optimizer_q.zero_grad(set_to_none=True)
         loss_q.backward()
-        # 添加梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.eval_qnet.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.eval_qnet.parameters()), cfg.grad_clip)
         self.optimizer_q.step()
+        self.optimizer_q.zero_grad(set_to_none=True)
 
-        # 计算参数网络损失（使用新的前向传播）
-        params = self.xnet(b_s)
-        actions_value, _ = self.eval_qnet(torch.cat((b_s, params), 1))
-        loss_x = -torch.mean(actions_value)
+        # Eq. (35) uses the replayed discrete action. Q and encoder remain fixed.
+        self.eval_qnet.requires_grad_(False)
+        encoder_mode = self.encoder.training
+        self.encoder.eval()
+        try:
+            with torch.no_grad():
+                actor_latent = self.encoder(self._tensor(states))
+            actor_parameters = self.xnet(actor_latent)
+            actor_q, _ = self.eval_qnet(actor_latent, actor_parameters)
+            loss_actor = -actor_q.gather(1, actions).mean()
+            self.optimizer_x.zero_grad(set_to_none=True)
+            loss_actor.backward()
+            torch.nn.utils.clip_grad_norm_(self.xnet.parameters(), cfg.grad_clip)
+            self.optimizer_x.step()
+        finally:
+            self.eval_qnet.requires_grad_(True)
+            self.encoder.train(encoder_mode)
+        self.memory.batch_update(indices, errors.detach().abs())
+        self.learn_step_counter += 1
+        update = cfg.target_update == "soft" or self.learn_step_counter % cfg.target_update_interval == 0
+        if update:
+            for target_module, module in ((self.target_encoder, self.encoder),
+                                          (self.target_xnet, self.xnet), (self.target_qnet, self.eval_qnet)):
+                soft_update(target_module, module, cfg.tau if cfg.target_update == "soft" else 1.0)
+        return float(loss_q.detach()), float(loss_actor.detach())
 
-        # 清零梯度并反向传播X网络损失
-        self.optimizer_x.zero_grad()
-        loss_x.backward()
-        # 添加梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.xnet.parameters(), max_norm=1.0)
-        self.optimizer_x.step()
+    def save(self, path, episode, metadata=None):
+        """Episode-boundary snapshot, including replay and all random generators."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {name: getattr(self, name).state_dict() for name in (
+            "encoder", "target_encoder", "xnet", "target_xnet", "eval_qnet", "target_qnet",
+            "optimizer_q", "optimizer_x")}
+        state.update(kind="dhea_mecd", metadata=metadata or {}, config=asdict(self.config), layout=asdict(self.layout), episode=episode,
+                     memory=self.memory, memory_counter=self.memory_counter,
+                     learn_step_counter=self.learn_step_counter, rng=self.rng.bit_generator.state,
+                     torch_rng=torch.get_rng_state(), numpy_rng=np.random.get_state(),
+                     python_rng=random.getstate(),
+                     cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        torch.save(state, temporary)
+        temporary.replace(path)
 
-        return loss_q.item(), loss_x.item()
-
-、
+    @classmethod
+    def load(cls, path, device="cpu"):
+        state = torch.load(path, map_location=device, weights_only=False)
+        cfg = AgentConfig(**{**state["config"], "device": device})
+        agent = cls(ObservationLayout(**state["layout"]), cfg)
+        for name in ("encoder", "target_encoder", "xnet", "target_xnet", "eval_qnet", "target_qnet",
+                     "optimizer_q", "optimizer_x"):
+            getattr(agent, name).load_state_dict(state[name])
+        agent.memory = state["memory"]
+        agent.metadata = state.get("metadata", {})
+        agent.memory_counter, agent.learn_step_counter = state["memory_counter"], state["learn_step_counter"]
+        agent.rng.bit_generator.state = state["rng"]
+        torch.set_rng_state(state["torch_rng"].cpu())
+        np.random.set_state(state["numpy_rng"])
+        random.setstate(state["python_rng"])
+        if state["cuda_rng"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda_rng"]])
+        return agent, state["episode"]

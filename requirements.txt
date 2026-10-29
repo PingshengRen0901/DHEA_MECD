@@ -1,0 +1,6 @@
+numpy>=1.24,<3
+torch>=2.2
+gymnasium>=1.0,<2
+matplotlib>=3.7
+scipy>=1.10
+pandas>=2.0

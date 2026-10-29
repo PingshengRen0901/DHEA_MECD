@@ -1,528 +1,220 @@
+"""Three-dimensional, sequential multi-target acquisition simulator.
+
+The paper does not specify target assignment or hydrodynamic coefficients.
+Those choices are exposed here and documented in README.md.
+"""
+from dataclasses import dataclass
+
+import gymnasium as gym
 import numpy as np
-from typing import Tuple
-from typing import Optional
-from typing import List
-from collections import namedtuple
-import pyglet
-import gym
-from gym import spaces
-from gym.utils import seeding
-# 兼容gym和gymnasium的logger API
-try:
-    gym.logger.set_level(40)  # gym的API
-except AttributeError:
-    gym.logger.min_level = 40  # gymnasium的API
-from hyenv.agents import BaseAgent
+from gymnasium import spaces
+
+from config import ObservationLayout
 from hyenv.agents import MovingAgent
-from hyenv.agents import SlidingAgent
+from hyenv.disturbances import OceanCurrent, UnderwaterNoise
+from hyenv.observations import appendix_observation
+
+ACCELERATE, TURN, PITCH, BREAK = range(4)
 
 
-# Action Id
-ACCELERATE = 0
-TURN = 1
-PITCH = 2  # 新增俯仰动作
-BREAK = 3
-
-Target = namedtuple('Target', ['x', 'y', 'z', 'radius'])  # 添加z坐标
-
-class DrawText:
-    def __init__(self, label:pyglet.text.Label):
-        self.label=label
-    def render(self):
-        self.label.draw()
+@dataclass
+class RewardConfig:
+    distance: float = 10.0
+    goal: float = 10.0
+    collision: float = 5.0
+    boundary: float = 2.0
 
 
-# 动作空间:
+class MovingEnv(gym.Env):
+    metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 30}
 
-class Action:
-    def __init__(self, id_: int, parameters: list):
-        self.id = id_
-        self.parameters = parameters
+    def __init__(self, n_targets=3, n_obstacles=2, max_step=800, delta_t=0.005,
+                 field_size=1.0, target_radius=0.1, obstacle_radius=0.08,
+                 agent_radius=0.025, target_speed=0.05, obstacle_speed=0.02,
+                 current_strength=0.1, noise_std=0.01, max_speed=2.0,
+                 max_acceleration=0.5, max_turn=np.pi / 2, max_pitch=np.pi / 4,
+                 max_braking=1.0, reward_config=None, render_mode=None, observation_dim=None,
+                 propulsion_weight=1.0, steering_weight=1.0, energy_reference=1.0,
+                 length_scale_m=None):
+        if max_step < 1 or delta_t <= 0 or field_size <= 0 or target_radius <= 0:
+            raise ValueError("Invalid time or workspace configuration")
+        if min(target_speed, obstacle_speed, current_strength, noise_std) < 0 or max_speed <= 0:
+            raise ValueError("Speeds, current and noise must be nonnegative; max_speed positive")
+        if obstacle_radius + agent_radius >= field_size or target_radius >= field_size:
+            raise ValueError("Object radii must fit inside the workspace")
+        if energy_reference <= 0 or min(propulsion_weight, steering_weight) < 0:
+            raise ValueError("Energy reference must be positive and weights nonnegative")
+        if length_scale_m is not None and length_scale_m <= 0:
+            raise ValueError("length_scale_m must be positive when supplied")
+        self.layout = ObservationLayout(n_targets, n_obstacles, observation_dim)
+        self.propulsion_weight, self.steering_weight = propulsion_weight, steering_weight
+        self.energy_reference, self.length_scale_m = energy_reference, length_scale_m
+        self.n_targets, self.n_obstacles = n_targets, n_obstacles
+        self.max_step, self.delta_t = max_step, delta_t
+        self.field_size, self.target_radius = field_size, target_radius
+        self.obstacle_radius, self.agent_radius = obstacle_radius, agent_radius
+        self.target_speed, self.obstacle_speed = target_speed, obstacle_speed
+        self.current_strength, self.noise_std = current_strength, noise_std
+        self.max_acceleration, self.max_turn, self.max_pitch = max_acceleration, max_turn, max_pitch
+        self.max_braking = max_braking
+        self.reward_config = reward_config or RewardConfig()
+        self.render_mode = render_mode
+        self.agent = MovingAgent(delta_t=delta_t, max_speed=max_speed)
+        self.action_space = spaces.Tuple((spaces.Discrete(4), spaces.Box(-1.0, 1.0, (4,), np.float32)))
+        self.observation_space = spaces.Box(0.0, 1.0, (self.layout.state_dim,), np.float32)
+        self._finished = True
+        self._figure = None
 
-    @property
-    def parameter(self) -> float:
-        # 刹车动作不需要参数
-        if self.id == BREAK:
-            return 0.0
-        # 其他动作返回对应参数
-        # 安全处理：确保索引在范围内
-        if self.id < len(self.parameters):
-            return self.parameters[self.id]
-        else:
-            return 0.0  # 默认值
+    def _positions(self, count, margin=0.15):
+        return self.np_random.uniform(-self.field_size + margin, self.field_size - margin, (count, 3))
 
+    def _velocities(self, count, speed):
+        v = self.np_random.normal(size=(count, 3))
+        return speed * v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-10)
 
-class Obstacle:
-    def __init__(self, x: float, y: float, z: float, r: float, speed: float):  # 添加z坐标
-        self.x = x
-        self.y = y
-        self.z = z  # 添加z坐标
-        self.r = r
-        self.vx = speed
-        self.vy = speed
-        self.vz = speed # z方向速度设为0
-
-    def update(self, delta_t: float) -> None:
-        self.x += self.vx * delta_t
-        self.y += self.vy * delta_t
-        self.z += self.vz * delta_t  # z方向移动
-
-
-
-    def update(self, delta_t: float) -> None:
-        self.x += self.vx * delta_t
-        self.y += self.vy * delta_t
-        self.z += self.vz * delta_t
-
-
-
- # 基础环境类
-class BaseEnv(gym.Env):
-    metadata = {"render.modes": ["human", "rgb_array"], "video.frames_per_second": 50}
-
-    """"
-    Gym environment parent class.
-    """
-    def __init__(
-            self,
-            seed: Optional[int] = None,
-            max_turn: float = np.pi/2,
-            max_pitch: float = np.pi / 4,  # 添加最大俯仰角参数
-            max_acceleration: float = 0.5,
-            delta_t: float = 0.005,
-            max_step: int = 200,
-            penalty: float = 0.001,
-            break_value: float = 0.1,
-
-
-            n_obstacles: int = 2,
-            obstacles_radius: float = 0.15,
-            obstacle_speed: float = 1.5,
-
-
-    ):
-
-        # Agent Parameters
-        self.max_turn = max_turn
-        self.max_pitch = max_pitch
-        self.max_acceleration = max_acceleration
-        self.break_value = break_value
-
-        # Environment Parameters
-        self.delta_t = delta_t
-        self.max_step = max_step
-        self.field_size = 1.0
-        self.target_radius = 0.1
-        self.penalty = penalty
-
-        # Initialization
-        self.seed(seed)
-        self.target = None
-        self.viewer = None
-        self.current_step = None
-        self.agent = BaseAgent(break_value=break_value, delta_t=delta_t)
-        self.mid_target_1 = None
-        ""
-        self.obstacles = []
-        self.n_obstacles = n_obstacles
-        self.obstacle_radius = obstacles_radius
-        self.obstacle_speed = obstacle_speed
-        ""
-
-        #洋流信息
-
-        self.current_x = 0.0  # 横向洋流初始值
-        self.current_y = 0.1  # 纵向固定洋流初始值
-        self.current_z = 0.0  # z向洋流初始值
-        self.time = 0.0  # 时间变量
-        self.current_amplitude = 0.02  # 洋流幅值
-        self.current_omega = 1.0  # 洋流角频率
-
-        # 高斯噪声标准差（作为状态中额外的4维噪声）
-        self.noise_std = 0.01  # 默认值，可根据需要调整
-
-        parameters_min = np.array([0, -1, -1])
-        parameters_max = np.array([1, +1, +1])
-        self.action_space = spaces.Tuple((
-            spaces.Discrete(4),  # 现在有4个动作：加速、转弯、刹车、俯仰
-            spaces.Box(parameters_min, parameters_max, dtype=np.float32)
-        ))
-        # 观测空间维度: 当前仅使用9维基础状态
-        obs_dim = 9
-        obs_low = -np.inf * np.ones(obs_dim, dtype=np.float32)
-        obs_high = np.inf * np.ones(obs_dim, dtype=np.float32)
-        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
-
-    def seed(self, seed: Optional[int] = None) -> list:
-        self.np_random, seed = seeding.np_random(seed)  # noqa
-        return [seed]
-
-    def reset(self, seed=None, options=None):
-
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
         self.current_step = 0
-
-        """目的地"""
-        limit = 0.5
-        low = [limit, limit, self.target_radius]
-        high = [limit, limit, self.target_radius]
-
-
-        self.target = Target(
-        self.np_random.uniform(0.5, 0.5),  # x
-        self.np_random.uniform(0.5, 0.5),  # y
-        0.0,  # z坐标初始化为0（保持二维平面）
-        self.target_radius
-    )
-
-
-        self.obstacles = []
-        for _ in range(self.n_obstacles): #生成两种障碍物
-            if _ == 0:
-                x = np.random.uniform(self.obstacle_radius, 0.5)  # [0.15, 0.5]
-                y = np.random.uniform(self.obstacle_radius, 0.5)
-                z = np.random.uniform(self.obstacle_radius, 0.5)  # 与x,y类似的z坐标范围
-            if _ == 1:
-                # self.obstacle_radius += 0.1
-                # 绿色
-                x = np.random.uniform(0, 1 - self.obstacle_radius)
-                y = np.random.uniform(0, 1 - self.obstacle_radius)
-                z = np.random.uniform(0, 1 - self.obstacle_radius)  # 与x,y类似的z坐标范围
-
-            obstacle = Obstacle(x, y, z, self.obstacle_radius, self.obstacle_speed)
-            self.obstacles.append(obstacle)
-
-        low = [-self.field_size, -self.field_size, 0, 0]  # x, y, z, theta 下界（z固定为0）
-        high = [self.field_size, self.field_size, 0, 2 * np.pi]  # 上界
-        x, y, z, theta = self.np_random.uniform(low, high)
-        phi = 0.0  # 初始俯仰角为0，保持在水平面
-        self.agent.reset(x, y, z, theta, phi)
-
-        # 确保洋流状态在reset后可用
-        self.current_x = 0.0
-        self.current_y = 0.1
-        self.current_z = 0.0
         self.time = 0.0
+        self.yaw_rate = 0.0
+        self.agent.reset(self._positions(1, self.agent_radius)[0],
+                         self.np_random.uniform(0, 2 * np.pi), self.np_random.uniform(-0.3, 0.3))
+        self.targets = self._positions(self.n_targets, self.target_radius)
+        self.target_velocities = self._velocities(self.n_targets, self.target_speed)
+        self.obstacles = self._positions(self.n_obstacles, self.obstacle_radius)
+        # Avoid initial collisions without allowing an unbounded rejection loop.
+        for i in range(self.n_obstacles):
+            for _ in range(1000):
+                if np.linalg.norm(self.obstacles[i] - self.agent.position) > self.agent_radius + self.obstacle_radius:
+                    break
+                self.obstacles[i] = self._positions(1, self.obstacle_radius)[0]
+            else:
+                raise RuntimeError("Could not sample a collision-free initial state")
+        self.obstacle_velocities = self._velocities(self.n_obstacles, self.obstacle_speed)
+        self.captured = np.zeros(self.n_targets, dtype=bool)
+        self.current_model = OceanCurrent(self.np_random, self.field_size, self.current_strength)
+        self.noise_model = UnderwaterNoise(self.np_random, self.noise_std)
+        self.current = self.current_model.velocity(self.agent.position, self.time)
+        self.noise = self.noise_model.sample(self.agent.speed, np.linalg.norm(self.current))
+        self.trajectory_length = self.energy_cost = 0.0
+        self._finished = False
+        return self.get_state(), self._info()
 
-        return self.get_state()
-
-    def step(self, raw_action: Tuple[int, list]) -> Tuple[list, float, bool, dict]:
-        action = Action(*raw_action)
-        last_distance = self.distance
-        self.current_step += 1
-        self.update_obstacles()
-
-        if action.id == TURN:
-            rotation = self.max_turn * max(min(action.parameter, 1), -1)
-            self.agent.turn(rotation)
-        elif action.id == ACCELERATE:
-            acceleration = self.max_acceleration * max(min(action.parameter, 1), 0)
-            self.agent.accelerate(acceleration)
-        elif action.id == PITCH:
-            pitch_change = self.max_pitch * max(min(action.parameter, 1), -1)
-            self.agent.pitch(pitch_change)
-        elif action.id == BREAK:
-            self.agent.break_()
-
-
-        # 🌊 洋流推动智能体
-        self.time += self.delta_t
-
-        # 动态洋流
-        self.current_x = self.current_amplitude * np.sin(self.current_omega * self.time)
-        self.current_y = 0.1  # 固定纵向洋流
-        self.current_z = 0.0  # z方向洋流为0
-
-
-        # 应用洋流
-        self.agent.x += self.current_x * self.delta_t
-        self.agent.y += self.current_y * self.delta_t
-        self.agent.z += self.current_z * self.delta_t
-
-        if self.distance < self.target_radius and self.agent.speed == 0:
-            reward = self.get_reward(last_distance, True)
-            done = True
-        elif (abs(self.agent.x) > self.field_size or
-              abs(self.agent.y) > self.field_size or
-              abs(self.agent.z) > self.field_size or
-              self.current_step >= self.max_step):
-            reward = -1
-            done = True
-        elif self.check_obstacle_collison():
-            reward = -1
-            done = True
-        else:
-            reward = self.get_reward(last_distance)
-            done = False
-
-        return self.get_state(), reward, done, {}
-
-    def get_state(self) -> np.ndarray:
-        # 基础状态向量 (9维)
-        state = np.array([
-            self.agent.x,
-            self.agent.y,
-            self.agent.z,  # 添加z坐标
-            # self.agent.speed,
-            # np.cos(self.agent.theta),
-            # np.sin(self.agent.theta),
-            # np.cos(self.agent.phi),
-            # np.sin(self.agent.phi),
-            self.target.x,
-            self.target.y,
-            self.target.z,  # 目标z坐标
-            self.distance,
-            0 if self.distance > self.target_radius else 1,
-            self.current_step / self.max_step,
-            # self.current_x,
-            # self.current_y,
-            # self.current_z,  # z方向洋流
-        ], dtype=np.float32)
-
-        # # 额外高斯噪声（4维）
-        # noise = self.np_random.normal(0.0, self.noise_std, size=13).astype(np.float32)
-
-        # # 障碍物相对位置添加z分量
-        # obstacles_relative = []
-        # for obs in self.obstacles:
-        #     dx = obs.x - self.agent.x
-        #     dy = obs.y - self.agent.y
-        #     dz = obs.z - self.agent.z
-        #     obstacles_relative.extend([dx, dy, dz])
-
-        # # 确保障碍物数据是numpy数组
-        # obstacles_relative = np.array(obstacles_relative, dtype=np.float32)
-
-        # 合并所有状态组件
-        # state_with_extra = np.concatenate([
-        #     np.array(state, dtype=np.float32), 
-        #     noise, 
-        #     obstacles_relative
-        # ])
-
-        return state
-
-
-
-    # def get_reward(self, last_distance: float, goal: bool = False) -> float:
-    #     return last_distance - self.distance - self.penalty + (1 if goal else 0)
-    def get_reward(self, last_distance: float, goal: bool = False) -> float:
-        """改进的奖励函数"""
-        current_distance = self.distance
-
-        # 基础距离奖励 - 鼓励接近目标
-        distance_reward = (last_distance - current_distance) * 10
-
-        # 到达目标奖励
-        goal_reward = 10 if goal else 0
-
-        # 碰撞惩罚
-        collision_penalty = -5 if self.check_obstacle_collison() else 0
-
-        # 边界惩罚
-        boundary_penalty = -2 if (abs(self.agent.x) > 0.9 or
-                                 abs(self.agent.y) > 0.9 or
-                                 abs(self.agent.z) > 0.9) else 0
-
-        total_reward = (distance_reward +  + goal_reward +
-                       collision_penalty + boundary_penalty)
-
-        return total_reward
     @property
-    def distance(self) -> float:
-        # 三维距离计算
-        return np.sqrt(
-            (self.agent.x - self.target.x)**2 + 
-            (self.agent.y - self.target.y)**2 +
-            (self.agent.z - self.target.z)**2
-        )
+    def distances(self):
+        return np.linalg.norm(self.targets - self.agent.position, axis=1)
 
-    @staticmethod
-    def get_distance(x1: float, y1: float, z1: float, x2: float, y2: float, z2: float) -> float:
-        """计算三维空间中的欧几里得距离"""
-        return np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2 + (z1 - z2) ** 2)
+    @property
+    def active_target(self):
+        return int(np.argmin(np.where(self.captured, np.inf, self.distances)))
 
-    def check_obstacle_collison(self) -> bool:
-        for obstacle in self.obstacles:
-            # 三维距离计算
-            distance = np.sqrt(
-                (self.agent.x - obstacle.x)**2 + 
-                (self.agent.y - obstacle.y)**2 +
-                (self.agent.z - obstacle.z)**2
-            )
-            if distance <= (0.05 + obstacle.r):
-                return True
-        return False
+    @property
+    def distance(self):
+        return float(self.distances[self.active_target])
 
-    def update_obstacles(self) -> None:
-        for obstacle in self.obstacles:
-            obstacle.update(self.delta_t)
-            if obstacle.x < obstacle.r or obstacle.x > (1 - obstacle.x):
-                obstacle.vx = -obstacle.vx
-            if obstacle.y < obstacle.r or obstacle.y > (1 - obstacle.y):
-                obstacle.vy = -obstacle.vy
-            if obstacle.z < obstacle.r or obstacle.z > (1 - obstacle.z):
-                obstacle.vz = -obstacle.vz
-    ""
+    def _move_objects(self, positions, velocities, radius):
+        positions += velocities * self.delta_t
+        limit = self.field_size - radius
+        for axis in range(3):
+            outside = np.abs(positions[:, axis]) > limit
+            velocities[outside, axis] *= -1
+        np.clip(positions, -limit, limit, out=positions)
 
+    def check_obstacle_collison(self):
+        return bool(np.any(np.linalg.norm(self.obstacles - self.agent.position, axis=1)
+                           <= self.agent_radius + self.obstacle_radius))
 
-    def render(self, mode='human'):
-        screen_width = 400
-        screen_height = 400
-        unit_x = screen_width / 2
-        unit_y = screen_height / 2
-        agent_radius = 0.05
-        current_step = self.current_step
+    def step(self, action):
+        if self._finished:
+            raise RuntimeError("Call reset() before stepping a finished episode")
+        discrete, parameters = action
+        parameters = np.asarray(parameters, dtype=np.float32)
+        if not self.action_space[0].contains(discrete) or parameters.shape != (4,) or not np.isfinite(parameters).all():
+            raise ValueError("Action must be (discrete_id in [0,3], four finite parameters)")
+        parameters = np.clip(parameters, -1, 1)
+        target = self.active_target
+        previous_distance = self.distances[target]
+        previous_position = self.agent.position.copy()
+        # n(t) affects actuation as well as being observed; no unused noise appendices.
+        disturbance = np.full(3, np.clip(self.noise.sum(), -0.1, 0.1))
+        self.yaw_rate = self.max_turn * float(parameters[1]) if discrete == TURN else 0.0
+        self.agent.advance(discrete, parameters, self.current, disturbance,
+                           self.max_acceleration, self.max_turn, self.max_pitch, self.max_braking)
+        self._move_objects(self.targets, self.target_velocities, self.target_radius)
+        self._move_objects(self.obstacles, self.obstacle_velocities, self.obstacle_radius)
+        self.current_step += 1
+        self.time = self.current_step * self.delta_t
+        self.current = self.current_model.velocity(self.agent.position, self.time)
+        self.noise = self.noise_model.sample(self.agent.speed, np.linalg.norm(self.current))
+        collision = self.check_obstacle_collison()
+        boundary = bool(np.any(np.abs(self.agent.position) > self.field_size))
+        # A collision/boundary event cannot also earn a target bonus.
+        new_captures = (~self.captured) & (self.distances < self.target_radius)
+        if collision or boundary:
+            new_captures[:] = False
+        self.captured |= new_captures
+        cfg = self.reward_config
+        components = {
+            "distance": cfg.distance * float(previous_distance - self.distances[target]),
+            "goal": cfg.goal * int(new_captures.sum()),
+            "collision": -cfg.collision * int(collision),
+            "boundary": -cfg.boundary * int(boundary),
+        }
+        success = bool(self.captured.all())
+        terminated = success or collision or boundary
+        truncated = self.current_step >= self.max_step and not terminated
+        self._finished = terminated or truncated
+        self.trajectory_length += float(np.linalg.norm(self.agent.position - previous_position))
+        # Unit-weight command cost (Table I lambda_p=lambda_s=1); only active command contributes.
+        magnitude = (parameters[discrete] + 1) / 2 if discrete in (ACCELERATE, BREAK) else parameters[discrete]
+        weight = self.propulsion_weight if discrete in (ACCELERATE, BREAK) else self.steering_weight
+        self.energy_cost += float(weight * magnitude ** 2 * self.delta_t / self.energy_reference)
+        info = self._info(collision, boundary)
+        info["reward_components"] = components
+        return self.get_state(), float(sum(components.values())), terminated, truncated, info
 
-        if self.viewer is None:
-            from gym.envs.classic_control import rendering
-            self.viewer = rendering.Viewer(screen_width, screen_height)
-            """渲染智能体"""
-            agent = rendering.make_circle(unit_x * agent_radius)
-            self.agent_trans = rendering.Transform(translation=(unit_x * (1 + self.agent.x), unit_y * (1 + self.agent.y)))  # noqa
-            agent.add_attr(self.agent_trans)
-            agent.set_color(0.1, 0.3, 0.9)
-            self.viewer.add_geom(agent)
+    def get_state(self):
+        if self.layout.observation_dim is not None:
+            return appendix_observation(self)
+        # Fixed finite bounds preserve meaning across episodes; heavy-tailed noise uses arctan.
+        position = lambda x: np.clip((np.asarray(x) / self.field_size + 1) / 2, 0, 1)
+        space = np.concatenate([position(self.agent.position), position(self.targets).ravel(),
+                                np.clip(self.distances / (2 * np.sqrt(3) * self.field_size), 0, 1),
+                                self.captured.astype(float)])
+        motion = np.concatenate([(self.agent.velocity / self.agent.max_speed + 1) / 2,
+                                 (np.array([np.sin(self.agent.theta), np.cos(self.agent.theta),
+                                            np.sin(self.agent.phi), np.cos(self.agent.phi)]) + 1) / 2,
+                                 [min(self.current_step / self.max_step, 1.0)]])
+        barrier = np.concatenate([np.clip((self.current / max(self.current_strength, 1e-8) + 1) / 2, 0, 1),
+                                  position(self.obstacles).ravel()])
+        noise = 0.5 + np.arctan(self.noise / max(self.noise_std, 1e-8)) / np.pi
+        return np.concatenate([space, motion, barrier, noise]).astype(np.float32)
 
-            """
-            渲染两个障碍物
-            """
-            # for obstacle in self.obstacles:
-            #     rend_obstacle = rendering.make_circle(unit_x * obstacle.r)
-            #     self.rend_obstacle_trans = rendering.Transform(translation=(unit_x * (1 + obstacle.x), unit_y * (1 + obstacle.y)))
-            #     print(self.rend_obstacle_trans)
-            #     rend_obstacle.add_attr(self.rend_obstacle_trans)
-            #     rend_obstacle.set_color(0.1, 0.2 ,0.6)
-            #     self.viewer.add_geom(rend_obstacle)
+    def _info(self, collision=False, boundary=False):
+        return {"success": bool(self.captured.all()), "captured_targets": int(self.captured.sum()),
+                "collision": collision, "boundary": boundary,
+                "trajectory_length": self.trajectory_length, "energy_cost": self.energy_cost}
 
-            rend_obstacle1 = rendering.make_circle(unit_x * self.obstacles[0].r)
-            self.rend_obstacle_trans1 = rendering.Transform(
-                translation=(unit_x * self.obstacles[0].x, unit_y * self.obstacles[0].y))
-            rend_obstacle1.add_attr(self.rend_obstacle_trans1)
-            rend_obstacle1.set_color(0.1, 0.2, 0.8)
-            self.viewer.add_geom(rend_obstacle1)
-
-            rend_obstacle2 = rendering.make_circle(unit_x * self.obstacles[1].r)
-            self.rend_obstacle_trans2 = rendering.Transform(
-                translation=(unit_x * (1 + self.obstacles[1].x), unit_y * (1 + self.obstacles[1].y)))
-            rend_obstacle2.add_attr(self.rend_obstacle_trans2)
-            rend_obstacle2.set_color(0.1, 0.2, 0.1)
-            self.viewer.add_geom(rend_obstacle2)
-
-            t, r, m = 0.1 * unit_x, 0.04 * unit_y, 0.06 * unit_x
-            arrow = rendering.FilledPolygon([(t, 0), (m, r), (m, -r)])
-            self.arrow_trans = rendering.Transform(rotation=self.agent.theta)  # noqa
-            arrow.add_attr(self.arrow_trans)
-            arrow.add_attr(self.agent_trans)
-            arrow.set_color(0, 0, 0)
-            self.viewer.add_geom(arrow)
-            """渲染目标"""
-            target = rendering.make_circle(unit_x * self.target_radius)
-            target_trans = rendering.Transform(translation=(unit_x * 1.5, unit_y * 1.5))
-            target.add_attr(target_trans)
-            target.set_color(1, 0.5, 0.5)
-            self.viewer.add_geom(target)
-
-            mid_target_1 = rendering.make_circle(unit_x * self.mid_target_1_radius)
-            mid_target_1_trans = rendering.Transform(translation=(unit_x * (1 + self.mid_target_1.x),1 + unit_y * (1 + self.mid_target_1.y)))
-            mid_target_1.add_attr(mid_target_1_trans)
-            mid_target_1.set_color(1, 0, 0)
-            self.viewer.add_geom(mid_target_1)
-        else:
-            # self.viewer.geoms = []
-            for geom in self.viewer.geoms:
-                if isinstance(geom, DrawText):
-                    geom.label.delete()
-                    self.viewer.geoms.remove(geom)
-        text = 'Step: {}'.format(current_step)
-        label = pyglet.text.Label(text, font_size=12,
-                                  x=10, y=10, anchor_x='left', anchor_y='bottom',
-                                  color=(255, 123, 255, 255))
-        self.viewer.add_geom(DrawText(label))
-        self.arrow_trans.set_rotation(self.agent.theta)
-        self.agent_trans.set_translation(unit_x * (1 + self.agent.x), unit_y * (1 + self.agent.y))
-
-
-        """
-        更新障碍物
-        """
-        # for i in range(self.n_obstacles):
-        #     self.rend_obstacle_trans.set_translation(unit_x * (1 + self.obstacles[i].x), unit_y * (1 + self.obstacles[i].y))
-        self.rend_obstacle_trans1.set_translation(unit_x * self.obstacles[0].x, unit_y * self.obstacles[0].y)
-        self.rend_obstacle_trans2.set_translation(unit_x * (1 + self.obstacles[1].x), unit_y * (1 + self.obstacles[1].y))
-
-        return self.viewer.render(return_rgb_array=mode == 'rgb_array')
+    def render(self):
+        import matplotlib.pyplot as plt
+        if self._figure is None:
+            self._figure = plt.figure(figsize=(6, 6))
+        self._figure.clear()
+        ax = self._figure.add_subplot(111, projection="3d")
+        ax.scatter(*self.agent.position, c="blue", label="AUV")
+        for i, point in enumerate(self.targets):
+            ax.scatter(*point, c="gray" if self.captured[i] else "green", marker="*")
+        if self.n_obstacles:
+            ax.scatter(*self.obstacles.T, c="red", s=80, label="Obstacles")
+        ax.set(xlim=(-self.field_size, self.field_size), ylim=(-self.field_size, self.field_size),
+               zlim=(-self.field_size, self.field_size), title=f"Step {self.current_step}")
+        self._figure.canvas.draw()
+        if self.render_mode == "rgb_array":
+            return np.asarray(self._figure.canvas.buffer_rgba())[..., :3].copy()
+        plt.pause(0.001)
 
     def close(self):
-        if self.viewer:
-            self.viewer.close()
-            self.viewer = None
-
-
-# Removed stray duplicate constructor blocks that caused recursion
-
-class MovingEnv(BaseEnv):
-    def __init__(
-            self,
-            seed: int = None,
-            max_turn: float = np.pi/2,
-            max_acceleration: float = 0.5,
-            delta_t: float = 0.005,
-            max_step: int = 300,
-            penalty: float = 0.001,
-            break_value: float = 0.1,
-            # 添加三维环境特有的参数
-            field_size: float = 1.0,  # 添加三维场大小
-    ):
-        # 调用父类初始化，但不要传递 field_size（BaseEnv 不接受）
-        super(MovingEnv, self).__init__(
-            seed=seed,
-            max_turn=max_turn,
-            max_acceleration=max_acceleration,
-            delta_t=delta_t,
-            max_step=max_step,
-            penalty=penalty,
-            break_value=break_value,
-        )
-
-        # 在子类中覆盖/设置三维场大小
-        self.field_size = field_size
-
-        # 确保使用三维智能体
-        self.agent = MovingAgent(
-            break_value=break_value,
-            delta_t=delta_t,
-        )
-
-
-class SlidingEnv(BaseEnv):
-    def __init__(
-            self,
-            seed: int = None,
-            max_turn: float = np.pi/2,
-            max_acceleration: float = 0.5,
-            delta_t: float = 0.005,
-            max_step: int = 300,
-            penalty: float = 0.001,
-            break_value: float = 0.1,
-            # 添加三维环境特有的参数
-            field_size: float = 1.0,  # 添加三维场大小
-    ):
-        # 调用父类初始化，但不要传递 field_size（BaseEnv 不接受）
-        super(SlidingEnv, self).__init__(
-            seed=seed,
-            max_turn=max_turn,
-            max_acceleration=max_acceleration,
-            delta_t=delta_t,
-            max_step=max_step,
-            penalty=penalty,
-            break_value=break_value,
-        )
-
-        # 在子类中覆盖/设置三维场大小
-        self.field_size = field_size
-
-        # 确保使用三维智能体
-        self.agent = SlidingAgent(
-            break_value=break_value,
-            delta_t=delta_t
-        )
+        if self._figure is not None:
+            import matplotlib.pyplot as plt
+            plt.close(self._figure)
+            self._figure = None

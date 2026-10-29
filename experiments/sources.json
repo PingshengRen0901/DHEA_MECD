@@ -1,0 +1,26 @@
+{
+  "sources": [
+    {
+      "filename": "1015Efficient_Mobile_Intelligence_for_AUV_Based_Multi_Target_Tracking_via__Structured_Perception_and__Multi_Expert_Reinforcement_Learning.pdf",
+      "sha256": "c2f3e751785d7b45e3bad09cea87fb4449ff8721e960a22fa63fa474bcd77b77"
+    },
+    {
+      "filename": "Detailed specifications of dimensional features.pdf",
+      "sha256": "b5250797d1c919a74e1c38b985dbf34cd38452f0614f849c063fd063f0d12b10",
+      "role": "secondary_local_dimensional_specification"
+    },
+    {
+      "filename": "Details about dimensional features.pdf",
+      "sha256": "b053d15a9e761a78444885b39ca563e94dc4ae792d73ee6591ba058c1b29fe8e",
+      "role": "secondary_local_dimensional_specification"
+    },
+    {
+      "filename": "1015appendix.pdf",
+      "sha256": "8ecd633fe39c85432d6a6d23f2dc0a332bbaf64598198cc7274d9706538b4032",
+      "role": "author_provided_authoritative_appendix",
+      "pages": 2
+    }
+  ],
+  "status": "Author-provided appendix verified: all four feature identities and index ranges agree with the implemented schemas. Remaining unspecified formulas are documented in docs/appendix_alignment.md.",
+  "authoritative_appendix": "1015appendix.pdf"
+}

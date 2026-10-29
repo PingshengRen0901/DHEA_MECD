@@ -1,15 +1,9 @@
-# my envs
-from gym.envs.registration import register
+"""Gymnasium environment registration (Moving-v0 retained for existing users)."""
+from gymnasium.envs.registration import register, registry
 from hyenv.environment import MovingEnv
-from hyenv.environment import SlidingEnv
 
+for env_id in ("Moving-v0", "AUVTracking-v0"):
+    if env_id not in registry:
+        register(id=env_id, entry_point="hyenv.environment:MovingEnv")
 
-#注册自定义Gym环境
-register(
-    id='Moving-v0',
-    entry_point='hyenv.environment:MovingEnv',
-)
-register(
-    id='Sliding-v0',
-    entry_point='hyenv.environment:SlidingEnv',
-)
+__all__ = ["MovingEnv"]

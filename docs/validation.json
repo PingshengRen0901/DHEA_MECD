@@ -1,0 +1,65 @@
+{
+  "date": "2026-10-29",
+  "runtime": {
+    "python": "3.11.13",
+    "torch": "2.7.1",
+    "numpy": "1.24.3",
+    "gymnasium": "1.2.0",
+    "device": "cpu"
+  },
+  "unit_tests": {
+    "command": "python -m unittest discover -s tests -v",
+    "passed": 25
+  },
+  "integration": [
+    {
+      "protocol": "smoke",
+      "runs": 40,
+      "training_episodes": 40,
+      "held_out_evaluation_episodes": 80,
+      "learning_updates": 164,
+      "all_runs_complete": true,
+      "reported_values_are_paper_results": false
+    },
+    {
+      "protocol": "smoke",
+      "runs": 3,
+      "training_episodes": 3,
+      "held_out_evaluation_episodes": 6,
+      "learning_updates": 15,
+      "all_runs_complete": true,
+      "reported_values_are_paper_results": false
+    }
+  ],
+  "formal_experiments_executed": false,
+  "full_training_episodes_per_run": 10000,
+  "full_matrix_runs": 120,
+  "appendix_status": "Author-provided 1015appendix.pdf verified (2 pages): all feature identities and index ranges match the implemented 9D/18D/27D/36D schemas. Remaining undefined constructions are documented.",
+  "pyvista": {
+    "native_render_verified": false,
+    "blocker": "No OpenGL context in this session",
+    "isolated_process_fallback_verified": true,
+    "fallback_renderer": "matplotlib"
+  },
+  "source_sha256": {
+    "config.py": "b413033ca875d2ece4d81ae7ab87e7f1c72fc3ea0d29b5ea46c6293ddbe0a368",
+    "encoder.py": "d2bc59079c616ed401c2cbd025d0c6a4c229df8b28ae60bf8ad12b75da7aa768",
+    "pdqn.py": "aff4906e379e2bbf6462adb56f37735290cb45b516adc2cc991d1d38e03caac1",
+    "PER.py": "6d981ea96dc7eea46a559c3238e11bbf95ef7cf5b23a0a9188666a197b992718",
+    "train.py": "9b48ede1e9415148c3ac3ec641fd30098db03b2674a62c52136d6725265acc8b",
+    "algorithms/baselines.py": "0b0c3ec2e5cdc63cc0160f8a2333472d4b723ac7110e809318a0e437b03908ed",
+    "hyenv/observations.py": "fcdacd434ee9d3e01608ca6256d2d5dac859ae456f9358b186b209f5f8c9a007",
+    "run_experiments.py": "0650c961005e0cd6729b0a052631f5a751b3172dc00cbc67caf432060370ba62",
+    "summarize.py": "1ffbba0f633e9db9afc2f63ccc592edd4c41d8db38ba8668491de10fddbbf3b0",
+    "plot_results.py": "da5feb879c51efccea34d3d1c9383d14d6715655bdf75ab703f8c337a0b9a73a",
+    "tests/test_experiments.py": "108eafd0784931cabce3fa47c55154370a0e784aa9d1bb59c777cb462fd5f4d6"
+  },
+  "appendix_alignment": {
+    "source": "1015appendix.pdf",
+    "sha256": "8ecd633fe39c85432d6a6d23f2dc0a332bbaf64598198cc7274d9706538b4032",
+    "feature_identity_and_index_alignment": true,
+    "schema_or_network_shape_changed": false,
+    "new_regression_tests": 4,
+    "audit": "docs/appendix_alignment.md"
+  }
+}
